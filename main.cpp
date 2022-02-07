@@ -6,8 +6,13 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
+
+
+#define POLL_SIZE 2048
 
 using namespace std;
 
@@ -52,7 +57,7 @@ int set_nonblock(int fd) // взято из тырнета
 #endif
 }
 
-int main(int argc, char* argv[]){
+int selectSocket(){
 	int masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	std::set<int> slaveSockets;
 	char buffer[2048]; // Создаём буфер на 2кб для чтения из сокета
@@ -115,3 +120,82 @@ int main(int argc, char* argv[]){
 	}
 	return 0;
 }
+
+int pollSocket () {
+	int masterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); // Создаём мастер сокет
+	std::set<int> slaveSockets; // Создаём сет для воркеров
+	char buffer[2048]; // Создаём буффер для сообщений
+
+	if(masterSocket == -1) // Проверяем на ошибки
+		perror("Error where open socket\n");
+
+	int flagReuseaddr = 1; // Устанавливаем сокет в reuseaddr. Чтоб можно было переисользовать порт сразу, а не ждать пока он закроется
+	if(setsockopt(masterSocket, SOL_SOCKET, SO_REUSEADDR, &flagReuseaddr, sizeof(flagReuseaddr)) == -1){
+		perror("Error where set reuseaddr\n");
+	}
+	set_nonblock(masterSocket); // Ставим в неблокирующий режим, чтоб мастер сокет мог принимать не завистая на accept
+
+	struct sockaddr_in serverAddr; // Создаём структуру с адресом нашего сервера
+	serverAddr.sin_family = AF_INET; // Указываем протокол IP
+	inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr); // Указываем адрес, который будем слушать
+	serverAddr.sin_port = htons(55002); // Указываем порт, на котором будем висеть
+
+	if(bind(masterSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == -1) // Биндим мастер сокет на наш адрес
+		perror("Error where bind to addr\n");
+
+	if(listen(masterSocket, SOMAXCONN) == -1) // Слушаем адрес
+		perror("Error where listen socket\n");
+
+	pollfd pollArray[POLL_SIZE]; // Создаём массив структур pollfd. В ней хранятся дескрипторы, события и возвращённые события
+
+	pollArray[0].fd = masterSocket; // Нулевой элемент - это мастер сокет
+	pollArray[0].events = POLLIN; // Он обрабатывает только POLLIN событие
+
+	while(true){
+		int indexSlavePollArray = 1; // Индекс внутри нашего массива pollArray
+		for(auto slaveSocket: slaveSockets){ // Итерируемся по дереву и пихаем в pollArray всех клиентов (втч новых, если кто-то подключился за предыдущий цикл)
+			pollArray[indexSlavePollArray].fd = slaveSocket; // Дескриптор
+			pollArray[indexSlavePollArray].events = POLLIN; // Событие
+			indexSlavePollArray++;
+		}
+		uint32_t sizePollArray = slaveSockets.size() + 1; // Чтобы не бегать по всем 2048 элементам, вычисляем размер (это необходимо для poll)
+
+		poll(pollArray, sizePollArray, -1); // Ждём пока полл вернёт событие в массив pollArray, размера sizePollArray. Ждать будем бесконечно
+
+		for(int concreteDescriptor = 0; concreteDescriptor < sizePollArray; concreteDescriptor++){ // Ходим по всем элементам, от 0 до sizePollArray
+			if(pollArray[concreteDescriptor].revents & POLLIN) { // Если в конкретном обработчике pollArray[concreteDescriptor] вернулось событие POLLIN, то обрабатываем его
+				if(concreteDescriptor) { // Если его индекс не равен 0 (0 это мастер, он принимает новые соединения)
+					memset(buffer, 0, sizeof(buffer)); // Обнуляем память
+					int sizeRecv = recv(pollArray[concreteDescriptor].fd, buffer, sizeof(buffer), MSG_NOSIGNAL); // Читаем из данного дескриптора
+					if(sizeRecv == 0 && errno != EAGAIN){ // Если данных нет, и ошибка не равна повторной попытке чтения из дескриптора, то убиваем сединение
+						shutdown(pollArray[concreteDescriptor].fd, SHUT_RDWR); // Кидаем FIN
+						slaveSockets.erase(pollArray[concreteDescriptor].fd); // Убираем из дерева
+						close(pollArray[concreteDescriptor].fd); // Полностью освобождаем десприктор
+					} else if (sizeRecv > 0){ // Если что-то пришло
+						for(auto otherSocket: slaveSockets) { // Итерируемся по всем клиентам
+							if(otherSocket != pollArray[concreteDescriptor].fd) // Только если это не отправитель
+								send(otherSocket, buffer, sizeof(buffer), MSG_NOSIGNAL); // То отправляем сообщение каждому соединенному клиенту
+						}
+					}
+				} else { // Если это нулево индекс, значит пришёл запрос на соединение
+					int slaveSocket = accept(masterSocket, 0, 0); // Отправляем ACK, выполняем рукопожатие ну и короче принимаем соединение
+					if(slaveSocket == -1)
+						perror("Error where accept\n");
+					set_nonblock(slaveSocket); // Устанавливаем в неблокирующий режим, чтобы не висеть на recv
+					slaveSockets.insert(slaveSocket); // Пихаем дескриптор нового клиента в дерево
+				}
+			}
+		}
+	}
+
+	return 0;
+}
+
+int main (int argc, char *argv[]) {
+	pollSocket();
+	return 0;
+}
+
+
+
+
